@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import copy
 import gc
 import os
 import time
@@ -58,6 +59,11 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
+from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                          has_kv_transfer_group)
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+from vllm.forward_context import (DPMetadata, get_forward_context,
+                                  set_forward_context)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
 from vllm.v1.pool.metadata import PoolingMetadata
@@ -1126,6 +1132,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens):
+            self.maybe_setup_kv_connector(scheduler_output)
             with ProfileExecuteDuration().capture_async("forward"):
                 model_kwargs = {}
                 if self.torchair_graph_enabled:
@@ -1157,6 +1164,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         **model_kwargs,
                     )
 
+        self.maybe_wait_for_kv_save()
+        finished_sending, finished_recving = (
+            self.get_finished_kv_transfers(scheduler_output))
+
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -1186,7 +1197,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         return (attn_metadata, hidden_states, spec_decode_metadata, positions,
                 total_num_scheduled_tokens, logits_indices, aux_hidden_states,
-                num_scheduled_tokens)
+                num_scheduled_tokens, finished_sending, finished_recving)
 
     def _get_cumsum_and_arange(
         self,
@@ -1373,6 +1384,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         num_scheduled_tokens_np: np.ndarray,
+        finished_sending: Optional[set[str]],
+        finished_recving: Optional[set[str]],
     ) -> ModelRunnerOutput:
         assert self.input_batch.num_reqs ==\
             len(self.input_batch.pooling_params), \
@@ -1407,6 +1420,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
+            finished_sending=finished_sending,
+            finished_recving=finished_recving
         )
 
     @torch.inference_mode()
@@ -1423,7 +1438,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 return EMPTY_MODEL_RUNNER_OUTPUT
             (attn_metadata, hidden_states, spec_decode_metadata, positions,
              num_scheduled_tokens, logits_indices, aux_hidden_states,
-             num_scheduled_tokens_np) = (self._process_reqs(
+             num_scheduled_tokens_np, finished_sending, finished_recving) = (self._process_reqs(
                  scheduler_output, intermediate_tensors))
 
         with ProfileExecuteDuration().capture_async("post process"):
@@ -1445,7 +1460,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             else:
                 if self.input_batch.pooling_params:
                     return self._pool(hidden_states, num_scheduled_tokens,
-                                      num_scheduled_tokens_np)
+                                      num_scheduled_tokens_np, finished_sending, finished_recving)
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states, None)
             if broadcast_pp_output:
@@ -1584,6 +1599,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=[],
+                finished_sending=finished_sending,
+                finished_recving=finished_recving
             )
 
         durations = ProfileExecuteDuration().pop_captured_sync()
@@ -1597,6 +1614,52 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         " ".join(dr_str))
 
         return model_runner_output
+
+    @staticmethod
+    def maybe_setup_kv_connector(scheduler_output: "SchedulerOutput"):
+        # Update KVConnector with the KVConnector metadata forward().
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            assert isinstance(kv_connector, KVConnectorBase_V1)
+            assert scheduler_output.kv_connector_metadata is not None
+            kv_connector.bind_connector_metadata(
+                scheduler_output.kv_connector_metadata)
+
+            # Background KV cache transfers happen here.
+            # These transfers are designed to be async and the requests
+            # involved may be disjoint from the running requests.
+            # Do this here to save a collective_rpc.
+            kv_connector.start_load_kv(get_forward_context())
+
+    @staticmethod
+    def maybe_wait_for_kv_save() -> None:
+        if has_kv_transfer_group():
+            get_kv_transfer_group().wait_for_save()
+
+    @staticmethod
+    def get_finished_kv_transfers(
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        if has_kv_transfer_group():
+            return get_kv_transfer_group().get_finished(
+                scheduler_output.finished_req_ids)
+        return None, None
+
+    def kv_connector_no_forward(
+            self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
+        # KV send/recv even if no work to do.
+        with set_forward_context(None, self.vllm_config):
+            self.maybe_setup_kv_connector(scheduler_output)
+            finished_sending, finished_recving = (
+                self.get_finished_kv_transfers(scheduler_output))
+
+        if not finished_sending and not finished_recving:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.finished_sending = finished_sending
+        output.finished_recving = finished_recving
+        return output
 
     @torch.inference_mode()
     def _dummy_run(
