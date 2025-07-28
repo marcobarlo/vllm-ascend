@@ -66,7 +66,7 @@ def maybe_save_kv_layer_to_connector(
         return
     # TODO: assert ascendMetadata
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
-  
+
 
 class AscendAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
